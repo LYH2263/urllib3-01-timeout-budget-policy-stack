@@ -40,6 +40,7 @@ from .exceptions import (
     TimeoutError,
 )
 from .response import BaseHTTPResponse
+from .util import budget
 from .util.connection import is_connection_dropped
 from .util.proxy import connection_requires_http_tunnel
 from .util.request import _TYPE_BODY_POSITION, set_file_position
@@ -351,15 +352,10 @@ class HTTPConnectionPool(ConnectionPool, RequestMethods):
 
     def _get_timeout(self, timeout: _TYPE_TIMEOUT) -> Timeout:
         """Helper that always returns a :class:`urllib3.util.Timeout`"""
-        if timeout is _DEFAULT_TIMEOUT:
-            return self.timeout.clone()
-
-        if isinstance(timeout, Timeout):
-            return timeout.clone()
-        else:
-            # User passed us an int/float. This is for backwards compatibility,
-            # can be removed later
-            return Timeout.from_float(timeout)
+        # Socket-side factory only. The pool queue wait has its own separate
+        # resolver (budget.resolve_pool_timeout) and must not be fed from
+        # here. An empty budget stack reproduces the pin resolution exactly.
+        return budget.resolve_attempt_timeout(self.timeout, timeout)
 
     def _raise_timeout(
         self,
@@ -462,7 +458,12 @@ class HTTPConnectionPool(ConnectionPool, RequestMethods):
 
         timeout_obj = self._get_timeout(timeout)
         timeout_obj.start_connect()
-        conn.timeout = Timeout.resolve_default_timeout(timeout_obj.connect_timeout)
+        # Connect-side merged view. The origin connect and the HTTP CONNECT
+        # tunnel handshake (driven from urlopen via _prepare_proxy /
+        # _validate_conn) share this number; it is never derived from the
+        # pool queue-wait ceiling. With an empty budget stack this is the pin
+        # Timeout.resolve_default_timeout(timeout_obj.connect_timeout).
+        conn.timeout = budget.resolve_connect_seconds(timeout_obj)
 
         try:
             # Trigger any extra validation we need to do.
@@ -472,94 +473,106 @@ class HTTPConnectionPool(ConnectionPool, RequestMethods):
                 self._raise_timeout(err=e, url=url, timeout_value=conn.timeout)
                 raise
 
-        # _validate_conn() starts the connection to an HTTPS proxy
-        # so we need to wrap errors with 'ProxyError' here too.
-        except (
-            OSError,
-            NewConnectionError,
-            TimeoutError,
-            BaseSSLError,
-            CertificateError,
-            SSLError,
-        ) as e:
-            new_e: Exception = e
-            if isinstance(e, (BaseSSLError, CertificateError)):
-                new_e = SSLError(e)
-            # If the connection didn't successfully connect to it's proxy
-            # then there
-            if isinstance(
-                new_e, (OSError, NewConnectionError, TimeoutError, SSLError)
-            ) and (conn and conn.proxy and not conn.has_connected_to_proxy):
-                new_e = _wrap_proxy_error(new_e, conn.proxy.scheme)
-            raise new_e
+            # _validate_conn() starts the connection to an HTTPS proxy
+            # so we need to wrap errors with 'ProxyError' here too.
+            except (
+                OSError,
+                NewConnectionError,
+                TimeoutError,
+                BaseSSLError,
+                CertificateError,
+                SSLError,
+            ) as e:
+                new_e: Exception = e
+                if isinstance(e, (BaseSSLError, CertificateError)):
+                    new_e = SSLError(e)
+                # If the connection didn't successfully connect to it's proxy
+                # then there
+                if isinstance(
+                    new_e, (OSError, NewConnectionError, TimeoutError, SSLError)
+                ) and (conn and conn.proxy and not conn.has_connected_to_proxy):
+                    new_e = _wrap_proxy_error(new_e, conn.proxy.scheme)
+                raise new_e
 
-        # conn.request() calls http.client.*.request, not the method in
-        # urllib3.request. It also calls makefile (recv) on the socket.
-        try:
-            conn.request(
-                method,
-                url,
-                body=body,
-                headers=headers,
-                chunked=chunked,
-                preload_content=preload_content,
-                decode_content=decode_content,
-                enforce_content_length=enforce_content_length,
-            )
+            # conn.request() calls http.client.*.request, not the method in
+            # urllib3.request. It also calls makefile (recv) on the socket.
+            try:
+                conn.request(
+                    method,
+                    url,
+                    body=body,
+                    headers=headers,
+                    chunked=chunked,
+                    preload_content=preload_content,
+                    decode_content=decode_content,
+                    enforce_content_length=enforce_content_length,
+                )
 
-        # We are swallowing BrokenPipeError (errno.EPIPE) since the server is
-        # legitimately able to close the connection after sending a valid response.
-        # With this behaviour, the received response is still readable.
-        except BrokenPipeError:
-            pass
-        except OSError as e:
-            # MacOS/Linux
-            # EPROTOTYPE and ECONNRESET are needed on macOS
-            # https://erickt.github.io/blog/2014/11/19/adventures-in-debugging-a-potential-osx-kernel-bug/
-            # Condition changed later to emit ECONNRESET instead of only EPROTOTYPE.
-            if e.errno != errno.EPROTOTYPE and e.errno != errno.ECONNRESET:
+            # We are swallowing BrokenPipeError (errno.EPIPE) since the server is
+            # legitimately able to close the connection after sending a valid
+            # response. With this behaviour, the received response is still
+            # readable.
+            except BrokenPipeError:
+                pass
+            except OSError as e:
+                # MacOS/Linux
+                # EPROTOTYPE and ECONNRESET are needed on macOS
+                # https://erickt.github.io/blog/2014/11/19/adventures-in-debugging-a-potential-osx-kernel-bug/
+                # Condition changed later to emit ECONNRESET instead of only
+                # EPROTOTYPE.
+                if e.errno != errno.EPROTOTYPE and e.errno != errno.ECONNRESET:
+                    raise
+
+            # Reset the timeout for the recv() on the socket. Empty stack:
+            # pin timeout_obj.read_timeout (total minus connect elapsed).
+            # READ_ISOLATED frame: merged read number as-is, connect elapsed
+            # is not deducted. Pool queue waits never reach this point.
+            read_timeout = budget.resolve_read_seconds(timeout_obj)
+
+            if not conn.is_closed:
+                # In Python 3 socket.py will catch EAGAIN and return None when you
+                # try and read into the file pointer created by http.client, which
+                # instead raises a BadStatusLine exception. Instead of catching
+                # the exception and assuming all BadStatusLine exceptions are read
+                # timeouts, check for a zero timeout before making the request.
+                if read_timeout == 0:
+                    raise ReadTimeoutError(
+                        self, url, f"Read timed out. (read timeout={read_timeout})"
+                    )
+                conn.timeout = read_timeout
+
+            # Receive the response from the server
+            try:
+                response = conn.getresponse()
+            except (BaseSSLError, OSError) as e:
+                self._raise_timeout(err=e, url=url, timeout_value=read_timeout)
                 raise
 
-        # Reset the timeout for the recv() on the socket
-        read_timeout = timeout_obj.read_timeout
+            # Set properties that are used by the pooling layer.
+            response.retries = retries
+            response._connection = response_conn  # type: ignore[attr-defined]
+            response._pool = self  # type: ignore[attr-defined]
 
-        if not conn.is_closed:
-            # In Python 3 socket.py will catch EAGAIN and return None when you
-            # try and read into the file pointer created by http.client, which
-            # instead raises a BadStatusLine exception. Instead of catching
-            # the exception and assuming all BadStatusLine exceptions are read
-            # timeouts, check for a zero timeout before making the request.
-            if read_timeout == 0:
-                raise ReadTimeoutError(
-                    self, url, f"Read timed out. (read timeout={read_timeout})"
-                )
-            conn.timeout = read_timeout
+            log.debug(
+                '%s://%s:%s "%s %s %s" %s %s',
+                self.scheme,
+                self.host,
+                self.port,
+                method,
+                url,
+                response.version_string,
+                response.status,
+                response.length_remaining,
+            )
 
-        # Receive the response from the server
-        try:
-            response = conn.getresponse()
-        except (BaseSSLError, OSError) as e:
-            self._raise_timeout(err=e, url=url, timeout_value=read_timeout)
-            raise
-
-        # Set properties that are used by the pooling layer.
-        response.retries = retries
-        response._connection = response_conn  # type: ignore[attr-defined]
-        response._pool = self  # type: ignore[attr-defined]
-
-        log.debug(
-            '%s://%s:%s "%s %s %s" %s %s',
-            self.scheme,
-            self.host,
-            self.port,
-            method,
-            url,
-            response.version_string,
-            response.status,
-            response.length_remaining,
-        )
-
-        return response
+            return response
+        finally:
+            # Snapshot the attempt elapsed on every exit, before the caller in
+            # urlopen() performs redirect/status-retry drains or
+            # Retry.sleep()/sleep_for_retry(). Only CHAIN_REMAINING frames
+            # consume it; everything else (including empty stack) is a no-op,
+            # so Retry-After/backoff wall clock stays outside Timeout ledger.
+            budget.note_attempt_elapsed(timeout_obj)
 
     def close(self) -> None:
         """
@@ -769,9 +782,17 @@ class HTTPConnectionPool(ConnectionPool, RequestMethods):
 
         timeout_obj = self._get_timeout(timeout)
         try:
+            # Pool queue wait exit. Resolved through its own factory, never
+            # through the socket-Timeouts factory: the wait_partition ledger
+            # is separate and the result is never folded into Timeout.total.
+            effective_pool_timeout = budget.resolve_pool_timeout(pool_timeout)
             # Request a connection from the queue.
-            conn = self._get_conn(timeout=pool_timeout)
-            conn.timeout = timeout_obj.connect_timeout  # type: ignore[assignment]
+            conn = self._get_conn(timeout=effective_pool_timeout)
+            # Connect-side merged view only: the HTTP CONNECT tunnel handshake
+            # below (and the origin connect inside _make_request) is bounded by
+            # this number. The read-side exemption of a READ_ISOLATED frame is
+            # never applied to the tunnel.
+            conn.timeout = budget.resolve_connect_seconds(timeout_obj)  # type: ignore[assignment]
 
             # Is this a closed/new connection that requires CONNECT tunnelling?
             if self.proxy is not None and http_tunnel_required and conn.is_closed:

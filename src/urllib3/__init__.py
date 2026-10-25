@@ -19,6 +19,13 @@ from .connectionpool import HTTPConnectionPool, HTTPSConnectionPool, connection_
 from .filepost import _TYPE_FIELDS, encode_multipart_formdata
 from .poolmanager import PoolManager, ProxyManager, proxy_from_url
 from .response import BaseHTTPResponse, HTTPResponse
+from .util.budget import (
+    BudgetMerge,
+    HopClock,
+    TimeoutBudgetFrame,
+    WaitPartition,
+    timeout_budget,
+)
 from .util.request import make_headers
 from .util.retry import Retry
 from .util.timeout import Timeout
@@ -58,6 +65,11 @@ __all__ = (
     "HTTPResponse",
     "Retry",
     "Timeout",
+    "TimeoutBudgetFrame",
+    "BudgetMerge",
+    "HopClock",
+    "WaitPartition",
+    "timeout_budget",
     "add_stderr_logger",
     "connection_from_url",
     "disable_warnings",
